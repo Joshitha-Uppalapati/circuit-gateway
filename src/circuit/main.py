@@ -15,6 +15,7 @@ from circuit.cost import estimate_cost_usd
 from circuit.quota import check_daily_quota, today_utc
 from circuit.storage.sqlite import init_db, record_request, add_spend
 from circuit.reliability.circuit_breaker import CircuitBreaker
+from circuit.reliability.rate_limiter import RateLimiter
 from circuit.stream_settlement import StreamSession
 
 
@@ -26,6 +27,7 @@ app.add_middleware(AuthMiddleware)
 
 provider = get_chat_provider()
 breaker = CircuitBreaker()
+rate_limiter = RateLimiter(capacity=20, refill_rate_per_sec=5)
 
 
 @app.on_event("startup")
@@ -43,9 +45,22 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     client_key_hash = getattr(request.state, "client_key_hash", "unknown")
     request_id = getattr(request.state, "request_id", "unknown")
 
+    # REAL-TIME RATE LIMIT 
+    if not rate_limiter.allow(client_key_hash):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "code": "rate_limited",
+                    "message": "Too many requests. Slow down.",
+                }
+            },
+        )
+
     payload = body.model_dump()
     model = payload.get("model", "unknown")
 
+    # PRE-COST QUOTA CHECK
     max_tokens = payload.get("max_tokens") or 0
     pre_cost = estimate_cost_usd(model, prompt_tokens=0, completion_tokens=int(max_tokens))
 
@@ -89,7 +104,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 async for chunk in provider.chat_completions_stream(payload):
                     text = ""
 
-                    # Handle dict chunks
+                    # Provider yielded dict
                     if isinstance(chunk, dict):
                         text = (
                             chunk.get("choices", [{}])[0]
@@ -97,11 +112,11 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                             .get("content", "")
                         )
 
-                    # Handle bytes chunks
+                    # Provider yielded bytes
                     elif isinstance(chunk, bytes):
                         chunk = chunk.decode("utf-8")
 
-                    # Handle string chunks (SSE format)
+                    # Provider yielded SSE string
                     if isinstance(chunk, str):
                         if chunk.startswith("data:"):
                             data_str = chunk.replace("data:", "", 1).strip()

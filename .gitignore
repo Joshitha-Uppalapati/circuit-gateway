@@ -26,4 +26,4 @@ data/
 *.sqlite3
 
 # logs
-*.log
+*.log*.egg-info/
