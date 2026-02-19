@@ -27,3 +27,4 @@ data/
 
 # logs
 *.log*.egg-info/
+*.egg-info/
