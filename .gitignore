@@ -1,0 +1,29 @@
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# venv
+.venv/
+venv/
+
+# env + secrets
+.env
+
+# macOS
+.DS_Store
+
+# tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# sqlite + local data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# logs
+*.log
