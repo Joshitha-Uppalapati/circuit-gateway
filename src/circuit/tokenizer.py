@@ -31,3 +31,4 @@ def count_tokens_from_messages(model: str, messages: list[dict]) -> int:
 def count_tokens_from_text(model: str, text: str) -> int:
     encoding = _get_encoding(model)
     return len(encoding.encode(text))
+

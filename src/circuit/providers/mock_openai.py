@@ -1,54 +1,65 @@
+import asyncio
 import time
 import uuid
 from typing import Dict, Any
+
+from circuit.reliability.timeouts import DEFAULT_TIMEOUT
 
 
 class MockOpenAIProvider:
     name = "mock-openai"
 
     async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        start = time.time()
+        start = time.perf_counter()
 
-        messages = payload.get("messages", [])
-        user_content = ""
+        async def _simulate():
+            # simulate slow upstream → triggers timeout
+            await asyncio.sleep(2)
 
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                user_content = m.get("content", "")
-                break
+            messages = payload.get("messages", [])
+            user_content = ""
 
-        created = int(time.time())
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    user_content = m.get("content", "")
+                    break
 
-        time.sleep(0.01)
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": payload.get("model", "gpt-4o"),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": f"Mock response to: {user_content}",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
 
-        latency_ms = int((time.time() - start) * 1000)
-
-        return {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": payload.get("model", "gpt-4o"),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": f"Mock response to: {user_content}",
-                    },
-                    "finish_reason": "stop",
+        try:
+            result = await asyncio.wait_for(
+                _simulate(),
+                timeout=DEFAULT_TIMEOUT.total_timeout,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "error": {
+                    "code": "timeout",
+                    "message": "Provider request timed out",
                 }
-            ],
-            "usage": {
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-                "total_tokens": 2,
-            },
-            "latency_ms": latency_ms,
-        }
+            }
 
-    async def chat_completions_stream(self, payload):
-        yield 'data: {"choices":[{"delta":{"content":"Mock "}}]}\n\n'
-        yield 'data: {"choices":[{"delta":{"content":"stream "}}]}\n\n'
-        yield 'data: {"choices":[{"delta":{"content":"response"}}]}\n\n'
-        yield "data: [DONE]\n\n"
+        latency_ms = (time.perf_counter() - start) * 1000
+        result["latency_ms"] = latency_ms
+
+        return result

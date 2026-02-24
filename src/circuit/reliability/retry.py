@@ -6,9 +6,9 @@ from typing import Callable, Awaitable, Any
 class RetryConfig:
     def __init__(
         self,
-        max_retries: int = 3,
+        max_retries: int = 2,
         base_delay: float = 0.1,
-        max_delay: float = 1.0,
+        max_delay: float = 0.5,
     ):
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -28,11 +28,13 @@ async def with_retries(
         try:
             result = await fn()
 
-            # retry only on structured error
             if isinstance(result, dict) and "error" in result:
                 code = result["error"].get("code")
 
-                if code in {"timeout", "server_error"}:
+                if code == "timeout":
+                    raise RuntimeError("timeout")
+
+                if code in {"server_error", "rate_limit"}:
                     raise RuntimeError(code)
 
             return result
@@ -48,7 +50,6 @@ async def with_retries(
                 config.max_delay,
             )
 
-            # small jitter
             delay += random.uniform(0, 0.05)
 
             await asyncio.sleep(delay)

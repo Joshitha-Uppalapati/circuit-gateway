@@ -11,7 +11,7 @@ from circuit.middleware.request_id import RequestIDMiddleware
 from circuit.middleware.latency import LatencyMiddleware
 
 from circuit.providers.factory import get_chat_provider
-from circuit.providers.mock_openai import MockOpenAIProvider
+from circuit.providers.ollama_provider import OllamaProvider
 
 from circuit.models.openai_compat import ChatCompletionRequest
 from circuit.cost import estimate_cost_usd
@@ -22,8 +22,6 @@ from circuit.reliability.rate_limiter import RateLimiter
 from circuit.reliability.retry import with_retries
 
 from circuit.observability.metrics import metrics
-
-from circuit.providers.mock_fallback import MockFallbackProvider
 
 from circuit.tokenizer import (
     count_tokens_from_messages,
@@ -39,10 +37,9 @@ app.add_middleware(AuthMiddleware)
 app.add_middleware(LatencyMiddleware)
 
 provider = get_chat_provider()
-fallback_provider = MockFallbackProvider()
+fallback_provider = OllamaProvider()
 
 breaker = CircuitBreaker()
-# strict limit: 20 tokens, refills at 5/sec
 rate_limiter = RateLimiter(capacity=20, refill_rate_per_sec=5)
 
 
@@ -74,7 +71,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     client_key_hash = getattr(request.state, "client_key_hash", "unknown")
     request_id = getattr(request.state, "request_id", "unknown")
 
-    # simple token bucket check per client
+    # rate limiting
     if not rate_limiter.allow(client_key_hash):
         metrics.inc("total_429", client=client_key_hash)
         metrics.inc("rate_limit_hits", client=client_key_hash)
@@ -95,33 +92,29 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     model = payload.get("model", "unknown")
     provider_used = type(provider).__name__
 
-    # primary attempt with retries
+    # PRIMARY + RETRY
     try:
-        result = await with_retries(
-            lambda: provider.chat_completions(payload)
-        )
+        result = await provider.chat_completions(payload)
 
-        # intercept soft provider errors
         if isinstance(result, dict) and "error" in result:
-            error_code = result["error"].get("code")
-            # treat these as hard failures to trigger fallback
-            if error_code in {"timeout", "service_unavailable", "internal_error"}:
-                raise RuntimeError(result["error"].get("message", "provider error"))
+            raise RuntimeError(result["error"].get("message"))
 
-    except Exception:
-        # fallback attempt
+    except Exception as e:
+        print("PRIMARY FAILED:", repr(e))
+
+        # FALLBACK
         try:
             result = await fallback_provider.chat_completions(payload)
-            
-            # catch soft errors from the fallback provider too
+
             if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(result["error"].get("message", "fallback provider error"))
+                raise RuntimeError(result["error"].get("message"))
 
             provider_used = type(fallback_provider).__name__
             metrics.inc("fallback_hits", client=client_key_hash)
 
-        except Exception:
-            # complete failure - both primary and fallback down
+        except Exception as e:
+            print("FALLBACK FAILED:", repr(e))
+
             breaker.record_failure()
 
             record_request(
@@ -148,7 +141,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 },
             )
 
-    # success path
+    # SUCCESS
     breaker.record_success()
 
     messages = payload.get("messages", [])
@@ -180,7 +173,6 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         cost_usd=cost_usd,
     )
 
-    # append circuit metadata for observability
     result["circuit"] = {
         "request_id": request_id,
         "client_key_hash": client_key_hash,
