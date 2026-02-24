@@ -16,6 +16,7 @@ from circuit.cost import estimate_cost_usd
 from circuit.storage.sqlite import init_db, record_request
 from circuit.reliability.circuit_breaker import CircuitBreaker
 from circuit.reliability.rate_limiter import RateLimiter
+from circuit.reliability.retry import with_retries
 from circuit.observability.metrics import metrics
 from circuit.tokenizer import (
     count_tokens_from_messages,
@@ -67,6 +68,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     if not rate_limiter.allow(client_key_hash):
         metrics.inc("total_429", client=client_key_hash)
         metrics.inc("rate_limit_hits", client=client_key_hash)
+
         return JSONResponse(
             status_code=429,
             content={
@@ -82,11 +84,71 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     payload = body.model_dump()
     model = payload.get("model", "unknown")
 
-    result = await provider.chat_completions(payload)
+    # Retry wrapper
+    try:
+        result = await with_retries(
+            lambda: provider.chat_completions(payload)
+        )
+    except Exception:
+        breaker.record_failure()
 
+        record_request(
+            request_id=request_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            provider=type(provider).__name__,
+            model=model,
+            status_code=503,
+            latency_ms=0,
+            tokens_input=0,
+            tokens_output=0,
+            cost_usd=0.0,
+        )
+
+        metrics.inc("total_503", client=client_key_hash)
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "retry_exhausted",
+                    "message": "Upstream failed after retries",
+                }
+            },
+        )
+
+    # Handle provider error AFTER retry
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"].get("code")
+
+        breaker.record_failure()
+
+        record_request(
+            request_id=request_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            provider=type(provider).__name__,
+            model=model,
+            status_code=503,
+            latency_ms=0,
+            tokens_input=0,
+            tokens_output=0,
+            cost_usd=0.0,
+        )
+
+        metrics.inc("total_503", client=client_key_hash)
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": code or "provider_error",
+                    "message": result["error"].get("message", "Upstream error"),
+                }
+            },
+        )
+
+    # Success path
     breaker.record_success()
 
-    # Real token counting
     messages = payload.get("messages", [])
     prompt_tokens = count_tokens_from_messages(model, messages)
 
