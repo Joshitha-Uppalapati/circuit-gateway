@@ -23,6 +23,9 @@ from circuit.reliability.timeout import with_timeout
 
 from circuit.cost.calculator import calculate_cost
 
+from circuit.quota import check_daily_quota
+
+from circuit.storage.redis_client import get_redis_client
 
 app = FastAPI()
 app.add_middleware(AuthMiddleware)
@@ -35,6 +38,13 @@ except Exception as e:
     print("PRIMARY INIT FAILED:", e)
     primary_provider = None
 
+redis_client = get_redis_client()
+
+if redis_client:
+    print("redis connected")
+else:
+    print("redis not available, using local state")
+    
 fallback_provider = OllamaProvider()
 
 
@@ -107,7 +117,20 @@ async def chat_completions(request: Request):
                 }
             },
         )
-
+    
+    # QUOTA ENFORCEMENT
+    ok, spent, limit = check_daily_quota(client_key_hash, 0.0)
+    if not ok:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "code": "quota_exceeded",
+                    "message": f"Daily limit of ${limit} reached",
+                }
+            },
+        )
+        
     metrics.inc("total_requests", client=client_key_hash)
 
     result = None
