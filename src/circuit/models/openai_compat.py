@@ -9,7 +9,6 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    stream: bool | None = False
     model: str
     messages: List[ChatMessage]
 
