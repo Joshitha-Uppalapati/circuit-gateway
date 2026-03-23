@@ -1,64 +1,74 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import time
+import uuid
+import asyncio
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from circuit.middleware.auth import AuthMiddleware
-from circuit.middleware.latency import LatencyMiddleware
-from circuit.middleware.logging import LoggingMiddleware
-from circuit.middleware.request_id import RequestIDMiddleware
-
-from circuit.cost import estimate_cost_usd
-from circuit.models.openai_compat import ChatCompletionRequest
-from circuit.observability.metrics import metrics
-from circuit.providers.factory import get_chat_provider
-from circuit.providers.ollama_provider import OllamaProvider
-from circuit.reliability.circuit_breaker import CircuitBreaker
-from circuit.reliability.rate_limiter import RateLimiter
-from circuit.reliability.redis_rate_limiter import RedisRateLimiter
-from circuit.reliability.retry import with_retries
 from circuit.storage.redis_client import get_redis_client
-from circuit.storage.sqlite import init_db, record_request
-from circuit.tokenizer import count_tokens_from_messages, count_tokens_from_text
+from circuit.reliability.redis_rate_limiter import RedisRateLimiter
+from circuit.reliability.redis_circuit_breaker import RedisCircuitBreaker, BreakerConfig
+
+from circuit.providers.mock_openai import MockOpenAIProvider
+from circuit.providers.ollama_provider import OllamaProvider
+
+from circuit.observability.metrics import metrics
+from circuit.observability.request_logger import log_request
+
+from circuit.reliability.retry import with_retries, DEFAULT_RETRY
+from circuit.reliability.timeout import with_timeout
+
+from circuit.cost.calculator import calculate_cost
 
 
 app = FastAPI()
-
-app.add_middleware(RequestIDMiddleware)
-app.add_middleware(LoggingMiddleware)
 app.add_middleware(AuthMiddleware)
-app.add_middleware(LatencyMiddleware)
 
-provider = get_chat_provider()
+
+# PROVIDERS
+try:
+    primary_provider = MockOpenAIProvider()
+except Exception as e:
+    print("PRIMARY INIT FAILED:", e)
+    primary_provider = None
+
 fallback_provider = OllamaProvider()
 
-breaker = CircuitBreaker()
 
-# Rate limit config
-RL_CAPACITY = 20
-RL_REFILL_PER_SEC = 5
-
-
+# REDIS
 redis_client = get_redis_client()
+
+
+# RATE LIMITER
 if redis_client:
     rate_limiter = RedisRateLimiter(
         redis_client=redis_client,
-        capacity=RL_CAPACITY,
-        refill_rate_per_sec=RL_REFILL_PER_SEC,
+        capacity=20,
+        refill_rate_per_sec=5,
     )
 else:
-    rate_limiter = RateLimiter(
-        capacity=RL_CAPACITY,
-        refill_rate_per_sec=RL_REFILL_PER_SEC,
+    rate_limiter = None
+
+
+# CIRCUIT BREAKER
+if redis_client:
+    breaker = RedisCircuitBreaker(
+        redis_client=redis_client,
+        name="primary",
+        config=BreakerConfig(
+            failure_threshold=3,
+            window_seconds=30,
+            cooldown_seconds=20,
+        ),
     )
+else:
+    breaker = None
 
 
-@app.on_event("startup")
-async def _startup():
-    init_db()
-
+# ROUTES
 
 @app.get("/health")
 async def health():
@@ -66,123 +76,171 @@ async def health():
 
 
 @app.get("/metrics")
-async def get_metrics(client: str | None = None):
-    return metrics.snapshot(client)
+async def get_metrics():
+    return metrics.snapshot()
 
 
 @app.get("/metrics/prometheus")
-async def prometheus_metrics():
-    return Response(content=metrics.prometheus(), media_type="text/plain")
+async def get_prometheus():
+    return metrics.prometheus()
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, body: ChatCompletionRequest):
-    client_key_hash = getattr(request.state, "client_key_hash", "unknown")
-    request_id = getattr(request.state, "request_id", "unknown")
+async def chat_completions(request: Request):
+    start = time.time()
+    request_id = str(uuid.uuid4())
 
-    # Rate limiting
-    if not rate_limiter.allow(client_key_hash):
-        metrics.inc("total_429", client=client_key_hash)
-        metrics.inc("rate_limit_hits", client=client_key_hash)
+    client_key_hash = request.state.client_key_hash
+    payload = await request.json()
+
+    failure_reason = None
+    provider_used = "primary"
+
+    # RATE LIMIT
+    if rate_limiter and not rate_limiter.allow(client_key_hash):
         return JSONResponse(
             status_code=429,
             content={
                 "error": {
                     "code": "rate_limited",
-                    "message": "Too many requests. Slow down.",
+                    "message": "Too many requests",
                 }
             },
         )
 
     metrics.inc("total_requests", client=client_key_hash)
 
-    payload = body.model_dump()
-    model = payload.get("model", "unknown")
-    provider_used = type(provider).__name__
+    result = None
+    try_primary = primary_provider is not None
 
-    # Primary (with retries)
-    try:
-        result = await with_retries(lambda: provider.chat_completions(payload))
+    # CIRCUIT CHECK
+    if try_primary and breaker and not breaker.allow_request():
+        print("CIRCUIT OPEN: skipping primary")
+        try_primary = False
 
-        if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(result["error"].get("message", "provider error"))
-
-    except Exception as e:
-        print("PRIMARY FAILED:", repr(e))
-
-        # Fallback (Ollama)
+    # PRIMARY CALL
+    if try_primary:
         try:
-            result = await fallback_provider.chat_completions(payload)
+            result = await with_retries(
+                lambda: with_timeout(
+                    lambda: primary_provider.chat_completions(payload),
+                    timeout_seconds=0.8,
+                ),
+                config=DEFAULT_RETRY,
+            )
 
-            if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(result["error"].get("message", "fallback error"))
+            if not result or "choices" not in result:
+                raise RuntimeError("invalid response from primary")
 
-            provider_used = type(fallback_provider).__name__
-            metrics.inc("fallback_hits", client=client_key_hash)
+            if breaker:
+                breaker.record_success()
 
         except Exception as e:
-            print("FALLBACK FAILED:", repr(e))
+            print(f"BREAKER STATE: {breaker.state.value if breaker else 'disabled'}")
 
-            breaker.record_failure()
-            metrics.inc("total_503", client=client_key_hash)
+            err = str(e).lower()
+            if "invalid response" in err:
+                failure_reason = "invalid_response"
+            elif "timeout" in err:
+                failure_reason = "timeout"
+            elif "forced failure" in err:
+                failure_reason = "forced_failure"
+            else:
+                failure_reason = "provider_error"
 
-            record_request(
-                request_id=request_id,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                provider=provider_used,
-                model=model,
-                status_code=503,
-                latency_ms=0,
-                tokens_input=0,
-                tokens_output=0,
-                cost_usd=0.0,
-            )
+            if breaker:
+                breaker.record_failure()
 
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": {
-                        "code": "fallback_failed",
-                        "message": "Primary and fallback providers both failed",
+            result = None
+
+    # FALLBACK
+    if result is None:
+        provider_used = "fallback"
+
+        task = asyncio.create_task(
+            fallback_provider.chat_completions(payload)
+        )
+
+        try:
+            result = await asyncio.wait_for(task, timeout=1.2)
+
+        except asyncio.TimeoutError:
+            task.cancel()
+
+            return {
+                "id": "timeout",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "none",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Request timed out. Please try again.",
+                        },
+                        "finish_reason": "timeout",
                     }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
                 },
-            )
+                "latency_ms": int((time.time() - start) * 1000),
+                "circuit": {
+                    "request_id": request_id,
+                    "client_key_hash": client_key_hash,
+                    "cost_usd": 0.0,
+                    "breaker_state": breaker.state.value if breaker else "disabled",
+                    "provider": "timeout",
+                },
+            }
 
-    # Success
-    breaker.record_success()
+    # SUCCESS
+    latency_ms = (time.time() - start) * 1000
 
-    messages = payload.get("messages", [])
-    prompt_tokens = count_tokens_from_messages(model, messages)
-
-    assistant_content = (
-        result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    )
-    completion_tokens = count_tokens_from_text(model, assistant_content)
-
-    cost_usd = estimate_cost_usd(model, prompt_tokens, completion_tokens)
-
+    metrics.observe_latency(latency_ms)
     metrics.inc("total_success", client=client_key_hash)
-    metrics.inc("total_tokens_input", prompt_tokens, client=client_key_hash)
-    metrics.inc("total_tokens_output", completion_tokens, client=client_key_hash)
-    metrics.inc("total_cost_usd", cost_usd, client=client_key_hash)
 
-    record_request(
-        request_id=request_id,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        provider=provider_used,
-        model=model,
-        status_code=200,
-        latency_ms=result.get("latency_ms", 0),
-        tokens_input=prompt_tokens,
-        tokens_output=completion_tokens,
-        cost_usd=cost_usd,
-    )
+    usage = result.get("usage", {})
+    model = result.get("model", "unknown")
 
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+
+    # FIXED COST CALCULATION
+    cost = calculate_cost(model, prompt_tokens, completion_tokens)
+    cost = cost if cost is not None else 0.0
+
+    metrics.inc("total_tokens_input", prompt_tokens or 0)
+    metrics.inc("total_tokens_output", completion_tokens or 0)
+
+    result["latency_ms"] = latency_ms
     result["circuit"] = {
         "request_id": request_id,
         "client_key_hash": client_key_hash,
-        "cost_usd": cost_usd,
-        "breaker_state": breaker.state.value,
+        "cost_usd": cost,
+        "breaker_state": breaker.state.value if breaker else "disabled",
+        "provider": provider_used,
     }
+
+    result["meta"] = {
+        "failure_reason": failure_reason,
+        "used_fallback": provider_used == "fallback",
+    }
+
+    log_request(
+        {
+            "request_id": request_id,
+            "client": client_key_hash,
+            "provider": provider_used,
+            "latency_ms": latency_ms,
+            "breaker_state": breaker.state.value if breaker else "disabled",
+            "tokens_in": prompt_tokens or 0,
+            "tokens_out": completion_tokens or 0,
+            "failure_reason": failure_reason,
+        }
+    )
 
     return result
