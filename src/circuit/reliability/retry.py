@@ -15,8 +15,11 @@ class RetryConfig:
         self.max_delay = max_delay
 
 
-DEFAULT_RETRY = RetryConfig()
-
+DEFAULT_RETRY = {
+    "max_retries": 1,   # was likely 2 or 3 → causing stacking
+    "backoff_base": 0.2,
+    "jitter": True,
+}
 
 async def with_retries(
     fn: Callable[[], Awaitable[Any]],

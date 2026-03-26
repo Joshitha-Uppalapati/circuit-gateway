@@ -6,7 +6,8 @@ __pycache__/
 
 # venv
 .venv/
-venv/
+*.pyc
+.env
 
 # env + secrets
 .env
@@ -28,3 +29,5 @@ data/
 # logs
 *.log*.egg-info/
 *.egg-info/
+
+src/circuit/logs/

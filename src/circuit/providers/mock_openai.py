@@ -7,7 +7,7 @@ class MockOpenAIProvider:
 
         # simulate failure trigger
         if "fail" in content or "force failure" in content:
-            raise Exception("forced failure for testing")
+            raise Exception("forced failure")
 
         return {
             "id": f"mock-{int(time.time())}",
