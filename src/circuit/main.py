@@ -10,12 +10,9 @@ from fastapi.responses import JSONResponse
 from circuit.middleware.auth import AuthMiddleware
 from circuit.storage.redis_client import get_redis_client
 from circuit.reliability.redis_rate_limiter import RedisRateLimiter
-from circuit.reliability.redis_circuit_breaker import (
-    RedisCircuitBreaker,
-    BreakerConfig,
-)
 from circuit.reliability.retry import with_retries, DEFAULT_RETRY
 from circuit.reliability.timeout import with_timeout
+from circuit.reliability.redis_circuit_breaker import RedisCircuitBreaker
 
 from circuit.providers.mock_openai import MockOpenAIProvider
 from circuit.providers.ollama_provider import OllamaProvider
@@ -30,10 +27,26 @@ from circuit.quota import check_daily_quota
 app = FastAPI()
 app.add_middleware(AuthMiddleware)
 
-
 # CONFIG
 GLOBAL_TIMEOUT_SECONDS = 3.0
 
+# REDIS
+redis_client = get_redis_client()
+
+if redis_client:
+    print("redis connected")
+else:
+    print("redis not available, using local state")
+
+# RATE LIMITER
+rate_limiter = (
+    RedisRateLimiter(redis_conn=redis_client, max_capacity=20, refill_rate=5.0)
+    if redis_client
+    else None
+)
+
+# CIRCUIT BREAKER (Redis-backed)
+breaker = RedisCircuitBreaker("openai") if redis_client else None
 
 # PROVIDERS
 try:
@@ -45,46 +58,13 @@ except Exception as e:
 fallback_provider = OllamaProvider()
 
 
-# REDIS
-redis_client = get_redis_client()
-
-if redis_client:
-    print("redis connected")
-else:
-    print("redis not available, using local state")
-
-
-# RATE LIMITER
-rate_limiter = (
-    RedisRateLimiter(redis_conn=redis_client, max_capacity=20, refill_rate=5.0)
-    if redis_client
-    else None
-)
-
-
-# -------------------------
-# CIRCUIT BREAKER
-# -------------------------
-breaker = (
-    RedisCircuitBreaker(
-        redis_client=redis_client,
-        name="primary",
-        config=BreakerConfig(
-            failure_threshold=3,
-            window_seconds=30,
-            cooldown_seconds=20,
-        ),
-    )
-    if redis_client
-    else None
-)
-
-
 def breaker_state_value() -> str:
     if not breaker:
         return "disabled"
-    state = breaker.state
-    return state.value if hasattr(state, "value") else str(state)
+
+    # read directly from redis
+    state = breaker.redis.get(f"circuit:breaker:{breaker.name}:state")
+    return state if state else "closed"
 
 
 # ROUTES
@@ -115,7 +95,7 @@ async def _handle_chat(request: Request):
     provider_used = "primary"
     tokens_left = -1
 
-    # rate limit
+    # RATE LIMIT
     if rate_limiter:
         is_allowed, tokens_left = rate_limiter.allow(client_key_hash)
 
@@ -135,7 +115,7 @@ async def _handle_chat(request: Request):
 
         metrics.inc("rate_limit_allowed", client=client_key_hash)
 
-    # quota
+    # QUOTA
     ok, spent, limit = check_daily_quota(client_key_hash, 0.0)
     if not ok:
         return JSONResponse(
@@ -153,17 +133,13 @@ async def _handle_chat(request: Request):
     result = None
     try_primary = primary_provider is not None
 
-    # breaker state metric
-    if breaker:
-        metrics.inc(f"breaker_state_{breaker_state_value()}")
-
-    # check breaker
-    if try_primary and breaker and not breaker.allow_request():
+    # CIRCUIT BREAKER CHECK
+    if try_primary and breaker and breaker.is_open():
         print("CIRCUIT OPEN: skipping primary")
         failure_reason = "breaker_open"
         try_primary = False
 
-    # primary
+    # PRIMARY CALL
     if try_primary:
         try:
             result = await with_retries(
@@ -183,26 +159,19 @@ async def _handle_chat(request: Request):
         except Exception as e:
             err = str(e).lower()
 
-            if "invalid response" in err:
-                failure_reason = "invalid_response"
-            elif "timeout" in err:
+            if "timeout" in err:
                 failure_reason = "timeout"
-            elif "forced failure" in err:
-                failure_reason = "forced_failure"
             else:
                 failure_reason = "provider_error"
 
             metrics.inc("total_failures", client=client_key_hash)
-            metrics.inc(f"failure_{failure_reason}", client=client_key_hash)
-
-            print(f"BREAKER STATE: {breaker_state_value()}")
 
             if breaker:
                 breaker.record_failure()
 
             result = None
 
-    # fallback
+    # FALLBACK
     if result is None:
         provider_used = "fallback"
         metrics.inc("fallback_requests", client=client_key_hash)
@@ -214,7 +183,6 @@ async def _handle_chat(request: Request):
 
         except asyncio.TimeoutError:
             task.cancel()
-            metrics.inc("fallback_timeouts", client=client_key_hash)
 
             return {
                 "id": "timeout",
@@ -226,7 +194,7 @@ async def _handle_chat(request: Request):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "Request timed out. Please try again.",
+                            "content": "Fallback timed out",
                         },
                         "finish_reason": "timeout",
                     }
@@ -236,33 +204,19 @@ async def _handle_chat(request: Request):
                     "completion_tokens": 0,
                     "total_tokens": 0,
                 },
-                "latency_ms": int((time.time() - start) * 1000),
-                "circuit": {
-                    "request_id": request_id,
-                    "client_key_hash": client_key_hash,
-                    "cost_usd": 0.0,
-                    "breaker_state": breaker_state_value(),
-                    "provider": "timeout",
-                    "tokens_left": tokens_left,
-                },
             }
 
-    # success
+    # SUCCESS PATH
     latency_ms = (time.time() - start) * 1000
-
-    metrics.observe_latency(latency_ms, client=client_key_hash)
-    metrics.inc("total_success", client=client_key_hash)
 
     usage = result.get("usage", {})
     model = result.get("model", "unknown")
 
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-
-    cost = calculate_cost(model, prompt_tokens, completion_tokens) or 0.0
-
-    metrics.inc("total_tokens_input", prompt_tokens or 0)
-    metrics.inc("total_tokens_output", completion_tokens or 0)
+    cost = calculate_cost(
+        model,
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+    ) or 0.0
 
     result["latency_ms"] = latency_ms
     result["circuit"] = {
@@ -287,8 +241,6 @@ async def _handle_chat(request: Request):
             "provider": provider_used,
             "latency_ms": latency_ms,
             "breaker_state": breaker_state_value(),
-            "tokens_in": prompt_tokens or 0,
-            "tokens_out": completion_tokens or 0,
             "failure_reason": failure_reason,
         }
     )
@@ -296,8 +248,7 @@ async def _handle_chat(request: Request):
     return result
 
 
-# PUBLIC ENDPOINT (with global timeout)
-
+# PUBLIC ENDPOINT
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
@@ -316,14 +267,9 @@ async def chat_completions(request: Request):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": "Request timed out (global timeout).",
+                        "content": "Request timed out",
                     },
                     "finish_reason": "timeout",
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
         }

@@ -1,87 +1,51 @@
 import time
-from enum import Enum
-
-
-class BreakerState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-class BreakerConfig:
-    def __init__(self, failure_threshold: int, window_seconds: int, cooldown_seconds: int):
-        self.failure_threshold = failure_threshold
-        self.window_seconds = window_seconds
-        self.cooldown_seconds = cooldown_seconds
-
+from circuit.storage.redis_client import get_redis_client
 
 class RedisCircuitBreaker:
-    def __init__(self, redis_client, name: str, config: BreakerConfig):
-        self.redis = redis_client
+    def __init__(self, name: str):
+        self.redis = get_redis_client()
         self.name = name
-        self.config = config
 
-    def _key(self):
-        return f"circuit:breaker:{self.name}"
+        self.failure_threshold = 3
+        self.recovery_timeout = 10  # seconds
 
-    def _get_state(self):
-        data = self.redis.hgetall(self._key())
+    def _state_key(self):
+        return f"circuit:breaker:{self.name}:state"
 
-        if not data:
-            return {
-                "state": BreakerState.CLOSED.value,
-                "failure_count": 0,
-                "last_failure_time": 0,
-            }
+    def _fail_count_key(self):
+        return f"circuit:breaker:{self.name}:failures"
 
-        return {
-            "state": data.get("state", BreakerState.CLOSED.value),
-            "failure_count": int(data.get("failure_count", 0)),
-            "last_failure_time": float(data.get("last_failure_time", 0)),
-        }
+    def _opened_at_key(self):
+        return f"circuit:breaker:{self.name}:opened_at"
 
-    def _set_state(self, state, failure_count, last_failure_time):
-        self.redis.hset(
-            self._key(),
-            mapping={
-                "state": state,
-                "failure_count": failure_count,
-                "last_failure_time": last_failure_time,
-            },
-        )
+    def is_open(self):
+        state = self.redis.get(self._state_key())
 
-    def allow_request(self) -> bool:
-        data = self._get_state()
-        state = data["state"]
-        last_failure_time = data["last_failure_time"]
+        if state == "open":
+            opened_at = self.redis.get(self._opened_at_key())
 
-        now = time.time()
+            if opened_at:
+                elapsed = time.time() - float(opened_at)
 
-        if state == BreakerState.OPEN.value:
-            if now - last_failure_time > self.config.cooldown_seconds:
-                # move to half-open
-                self._set_state(BreakerState.HALF_OPEN.value, 0, last_failure_time)
-                return True
-            return False
+                # allow half-open after timeout
+                if elapsed > self.recovery_timeout:
+                    self.redis.set(self._state_key(), "half_open")
+                    return False
 
-        return True
+            return True
+
+        return False
 
     def record_success(self):
-        # reset breaker
-        self._set_state(BreakerState.CLOSED.value, 0, 0)
+        state = self.redis.get(self._state_key())
+        # only close if we are in half-open
+        if state == "half_open":
+            self.redis.set(self._state_key(), "closed")
+            self.redis.set(self._fail_count_key(), 0)
 
     def record_failure(self):
-        data = self._get_state()
+        failures = self.redis.incr(self._fail_count_key())
 
-        failure_count = data["failure_count"] + 1
-        now = time.time()
-
-        if failure_count >= self.config.failure_threshold:
-            # open breaker
-            self._set_state(BreakerState.OPEN.value, failure_count, now)
-        else:
-            self._set_state(data["state"], failure_count, now)
-
-    @property
-    def state(self):
-        return self._get_state()["state"]
+        if failures >= self.failure_threshold:
+            self.redis.set(self._state_key(), "open")
+            self.redis.set(self._opened_at_key(), time.time())
