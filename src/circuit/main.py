@@ -10,16 +10,14 @@ from fastapi.responses import JSONResponse
 from circuit.middleware.auth import AuthMiddleware
 from circuit.storage.redis_client import get_redis_client
 from circuit.reliability.redis_rate_limiter import RedisRateLimiter
+from circuit.reliability.redis_circuit_breaker import RedisCircuitBreaker
 from circuit.reliability.retry import with_retries, DEFAULT_RETRY
 from circuit.reliability.timeout import with_timeout
-from circuit.reliability.redis_circuit_breaker import RedisCircuitBreaker
 
 from circuit.providers.mock_openai import MockOpenAIProvider
 from circuit.providers.ollama_provider import OllamaProvider
 
-from circuit.observability.metrics import metrics
 from circuit.observability.request_logger import log_request
-
 from circuit.cost.calculator import calculate_cost
 from circuit.quota import check_daily_quota
 
@@ -30,13 +28,15 @@ app.add_middleware(AuthMiddleware)
 # CONFIG
 GLOBAL_TIMEOUT_SECONDS = 3.0
 
-# REDIS
+
+# REDIS SETUP
 redis_client = get_redis_client()
 
 if redis_client:
     print("redis connected")
 else:
-    print("redis not available, using local state")
+    print("redis not available")
+
 
 # RATE LIMITER
 rate_limiter = (
@@ -45,8 +45,33 @@ rate_limiter = (
     else None
 )
 
-# CIRCUIT BREAKER (Redis-backed)
-breaker = RedisCircuitBreaker("openai") if redis_client else None
+
+# CIRCUIT BREAKER
+breaker = (
+    RedisCircuitBreaker("primary")
+    if redis_client
+    else None
+)
+
+
+def breaker_state_value():
+    """
+    Safely read breaker state from Redis.
+    Redis can return bytes OR str depending on config.
+    """
+    if not breaker:
+        return "disabled"
+
+    state = breaker.redis.get(breaker._state_key())
+
+    if state is None:
+        return "closed"
+
+    if isinstance(state, bytes):
+        return state.decode()
+
+    return str(state)
+
 
 # PROVIDERS
 try:
@@ -58,50 +83,65 @@ except Exception as e:
 fallback_provider = OllamaProvider()
 
 
-def breaker_state_value() -> str:
-    if not breaker:
-        return "disabled"
-
-    # read directly from redis
-    state = breaker.redis.get(f"circuit:breaker:{breaker.name}:state")
-    return state if state else "closed"
-
-
-# ROUTES
+# HEALTH
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/metrics")
-async def get_metrics():
-    return metrics.snapshot()
-
-
-@app.get("/metrics/prometheus")
-async def get_prometheus():
-    return metrics.prometheus()
-
-
-# INTERNAL HANDLER
+# CORE REQUEST HANDLER
 async def _handle_chat(request: Request):
     start = time.time()
     request_id = str(uuid.uuid4())
 
     client_key_hash = request.state.client_key_hash
-    payload = await request.json()
 
+    # PARSE REQUEST
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "invalid_json",
+                    "message": "Malformed JSON request",
+                }
+            },
+        )
+
+    # DEFAULTS
+    result = None
     failure_reason = None
     provider_used = "primary"
     tokens_left = -1
 
+    prompt_tokens = 0
+    completion_tokens = 0
+
     # RATE LIMIT
     if rate_limiter:
-        is_allowed, tokens_left = rate_limiter.allow(client_key_hash)
-
-        if not is_allowed:
-            metrics.inc("rate_limit_blocked", client=client_key_hash)
-
+        allowed, tokens_left = rate_limiter.allow(client_key_hash)
+        
+        if not allowed:
+            failure_reason = "rate_limited"
+            
+            try:
+                log_request({
+                    "request_id": request_id,
+                    "client": client_key_hash,
+                    "provider": "none",
+                    "latency_ms": (time.time() - start) * 1000,
+                    "breaker_state": breaker_state_value(),
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "failure_reason": failure_reason,
+                    "input_size": len(str(payload)),
+                    "used_fallback": False,
+                })
+            except Exception:
+                pass
+            
             return JSONResponse(
                 status_code=429,
                 content={
@@ -110,81 +150,95 @@ async def _handle_chat(request: Request):
                         "message": "Too many requests",
                     }
                 },
-                headers={"X-RateLimit-Remaining": str(tokens_left)},
             )
 
-        metrics.inc("rate_limit_allowed", client=client_key_hash)
-
     # QUOTA
-    ok, spent, limit = check_daily_quota(client_key_hash, 0.0)
+    ok, _, limit = check_daily_quota(client_key_hash, 0.0)
+
     if not ok:
+        failure_reason = "quota_exceeded"
+        
+        try:
+            log_request({
+                "request_id": request_id,
+                "client": client_key_hash,
+                "provider": "none",
+                "latency_ms": (time.time() - start) * 1000,
+                "breaker_state": breaker_state_value(),
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "failure_reason": failure_reason,
+                "input_size": len(str(payload)),
+                "used_fallback": False,
+            })
+        except Exception:
+            pass
+        
         return JSONResponse(
             status_code=429,
             content={
                 "error": {
                     "code": "quota_exceeded",
-                    "message": f"Daily limit of ${limit} reached",
+                    "message": f"Daily limit ${limit} reached",
                 }
             },
         )
 
-    metrics.inc("total_requests", client=client_key_hash)
-
-    result = None
-    try_primary = primary_provider is not None
-
-    # CIRCUIT BREAKER CHECK
-    if try_primary and breaker and breaker.is_open():
-        print("CIRCUIT OPEN: skipping primary")
-        failure_reason = "breaker_open"
-        try_primary = False
-
     # PRIMARY CALL
-    if try_primary:
-        try:
-            result = await with_retries(
-                lambda: with_timeout(
-                    lambda: primary_provider.chat_completions(payload),
-                    timeout_seconds=1.2,
-                ),
-                config=DEFAULT_RETRY,
-            )
+    if primary_provider:
+        try_primary = True
 
-            if not result or "choices" not in result:
-                raise RuntimeError("invalid response from primary")
+        if breaker and not breaker.allow_request():
+            try_primary = False
+            failure_reason = "breaker_open"
 
-            if breaker:
-                breaker.record_success()
+        if try_primary:
+            try:
+                result = await with_retries(
+                    lambda: with_timeout(
+                        lambda: primary_provider.chat_completions(payload),
+                        timeout_seconds=1.2,
+                    ),
+                    config=DEFAULT_RETRY,
+                )
 
-        except Exception as e:
-            err = str(e).lower()
+                if not result or "choices" not in result:
+                    raise RuntimeError("invalid response")
 
-            if "timeout" in err:
-                failure_reason = "timeout"
-            else:
-                failure_reason = "provider_error"
+                if breaker:
+                    breaker.record_success()
 
-            metrics.inc("total_failures", client=client_key_hash)
+            except Exception as e:
+                err = str(e).lower()
 
-            if breaker:
-                breaker.record_failure()
+                failure_reason = "timeout" if "timeout" in err else "provider_error"
 
-            result = None
+                if breaker:
+                    breaker.record_failure()
+
+                result = None
 
     # FALLBACK
     if result is None:
         provider_used = "fallback"
-        metrics.inc("fallback_requests", client=client_key_hash)
-
-        task = asyncio.create_task(fallback_provider.chat_completions(payload))
 
         try:
-            result = await asyncio.wait_for(task, timeout=2.5)
+            result = await asyncio.wait_for(
+                fallback_provider.chat_completions(payload),
+                timeout=2.5,
+            )
+
+            # fallback worked → system recovered
+            if failure_reason is None:
+                failure_reason = "primary_unavailable"
+            
+            elif failure_reason == "provider_error" and breaker and not breaker.allow_request():
+                failure_reason = "breaker_open"
 
         except asyncio.TimeoutError:
-            task.cancel()
+            failure_reason = "fallback_timeout"
 
-            return {
+            result = {
                 "id": "timeout",
                 "object": "chat.completion",
                 "created": int(time.time()),
@@ -194,31 +248,53 @@ async def _handle_chat(request: Request):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "Fallback timed out",
+                            "content": "Request timed out.",
                         },
                         "finish_reason": "timeout",
                     }
                 ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
+                "usage": {},
             }
 
-    # SUCCESS PATH
-    latency_ms = (time.time() - start) * 1000
+        except Exception:
+            failure_reason = "fallback_error"
 
+            result = {
+                "id": "error",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "none",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Fallback failed.",
+                        },
+                        "finish_reason": "error",
+                    }
+                ],
+                "usage": {},
+            }
+
+    # METRICS + ENRICHMENT
     usage = result.get("usage", {})
-    model = result.get("model", "unknown")
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
 
-    cost = calculate_cost(
-        model,
-        usage.get("prompt_tokens"),
-        usage.get("completion_tokens"),
-    ) or 0.0
+    latency_ms = (time.time() - start) * 1000
+    
+    if provider_used == "fallback":
+        cost = 0.0
+    else:
+        cost = calculate_cost(
+            result.get("model", "unknown"),
+            prompt_tokens,
+            completion_tokens,
+        ) or 0.0
 
     result["latency_ms"] = latency_ms
+
     result["circuit"] = {
         "request_id": request_id,
         "client_key_hash": client_key_hash,
@@ -231,19 +307,25 @@ async def _handle_chat(request: Request):
     result["meta"] = {
         "failure_reason": failure_reason,
         "used_fallback": provider_used == "fallback",
-        "is_degraded": provider_used == "fallback",
+        "is_degraded": failure_reason is not None
     }
 
-    log_request(
-        {
+    # LOGGING (never block response)
+    try:
+        log_request({
             "request_id": request_id,
             "client": client_key_hash,
             "provider": provider_used,
             "latency_ms": latency_ms,
             "breaker_state": breaker_state_value(),
+            "tokens_in": prompt_tokens,
+            "tokens_out": completion_tokens,
             "failure_reason": failure_reason,
-        }
-    )
+            "input_size": len(str(payload)),
+            "used_fallback": provider_used == "fallback",
+        })
+    except Exception as e:
+        print("LOGGING FAILED:", e)
 
     return result
 
@@ -267,9 +349,10 @@ async def chat_completions(request: Request):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": "Request timed out",
+                        "content": "Global timeout.",
                     },
                     "finish_reason": "timeout",
                 }
             ],
+            "usage": {},
         }
