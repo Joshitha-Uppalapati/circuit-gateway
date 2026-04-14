@@ -2,11 +2,9 @@ from circuit.storage.postgres_client import get_postgres_conn
 
 
 def log_request(data: dict):
-    print("LOGGING CALLED:", data)
     conn = get_postgres_conn()
 
     if not conn:
-        print("no postgres, skipping log")
         return
 
     try:
@@ -18,7 +16,6 @@ def log_request(data: dict):
             tokens_in, tokens_out, failure_reason,
             input_size, used_fallback
         )
-        
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             data["request_id"],
@@ -37,5 +34,5 @@ def log_request(data: dict):
         cursor.close()
         conn.close()
 
-    except Exception as e:
-        print("failed to log request:", e)
+    except Exception:
+        pass

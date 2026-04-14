@@ -1,74 +1,120 @@
-import time
+from __future__ import annotations
+
 import math
+import time
+
 
 class RedisRateLimiter:
     def __init__(self, redis_conn, max_capacity: int, refill_rate: float):
+        if max_capacity <= 0:
+            raise ValueError("max_capacity must be > 0")
+        if refill_rate <= 0:
+            raise ValueError("refill_rate must be > 0")
+
         self.redis = redis_conn
-        self.maxTokens = max_capacity
+        self.max_capacity = max_capacity
         self.refill_rate = refill_rate
 
-        self.script_content = """
+        self._scale = 1000
+        self._capacity_scaled = max_capacity * self._scale
+        self._refill_per_sec_scaled = max(1, int(round(refill_rate * self._scale)))
+
+        self._script = self.redis.register_script(
+            """
             local key = KEYS[1]
-            local cap = tonumber(ARGV[1])
-            local rate = tonumber(ARGV[2])
-            local current_time = tonumber(ARGV[3])
-            local req_cost = tonumber(ARGV[4])
 
-            -- grab both fields at once
-            local bucket = redis.call("HMGET", key, "tokens", "last_update")
-            local current_tokens = tonumber(bucket[1])
-            local last_update = tonumber(bucket[2])
+            local capacity = tonumber(ARGV[1])
+            local refill_per_sec = tonumber(ARGV[2])
+            local now_ms = tonumber(ARGV[3])
+            local cost = tonumber(ARGV[4])
+            local scale = tonumber(ARGV[5])
 
-            -- init bucket if this is a new client
-            if current_tokens == nil then
-                current_tokens = cap
-                last_update = current_time
+            local bucket = redis.call("HMGET", key, "tokens", "last_ms")
+            local tokens = tonumber(bucket[1])
+            local last_ms = tonumber(bucket[2])
+
+            if not tokens or not last_ms then
+                tokens = capacity
+                last_ms = now_ms
             end
 
-            local elapsed = math.max(0, current_time - last_update)
-            
-            -- use floor to avoid weird fractional tokens like 0.16489... causing precision drift
-            local refill_amount = math.floor(elapsed * rate)
-            local new_tokens = math.min(cap, current_tokens + refill_amount)
-
-            local is_allowed = 0
-
-            -- check if we can afford the request
-            if new_tokens >= req_cost then
-                new_tokens = new_tokens - req_cost
-                is_allowed = 1
+            if now_ms < last_ms then
+                now_ms = last_ms
             end
-            
-            -- always update the state so time moves forward for the client
-            redis.call("HMSET", key, "tokens", new_tokens, "last_update", current_time)
 
-            -- fix the TTL so it's not a hardcoded 60s. it should live exactly as long as it takes to refill
-            local expire_time = math.ceil(cap / rate)
-            redis.call("EXPIRE", key, expire_time)
+            local elapsed_ms = now_ms - last_ms
+            if elapsed_ms > 0 then
+                local refill = math.floor((elapsed_ms * refill_per_sec) / 1000)
+                if refill > 0 then
+                    tokens = math.min(capacity, tokens + refill)
+                    last_ms = now_ms
+                end
+            end
 
-            return {is_allowed, new_tokens}
-        """
-        
-        self._lua = self.redis.register_script(self.script_content)
+            local allowed = 0
+            local retry_after = 0
 
-    def allow(self, client_id: str, cost: int = 1) -> tuple[bool, int]:
-        # added proper namespace so we don't clash with the circuit breaker keys later
-        cache_key = f"circuit:rl:{client_id}"
-        now_ts = time.time()
-        
-        # print(f"DEBUG: checking rate limit for {client_id} at {now_ts}")
-        
-        try:
-            res = self._lua(
-                keys=[cache_key], 
-                args=[self.maxTokens, self.refill_rate, now_ts, cost]
-            )
-            
-            allowed_flag = res[0]
-            tokens_left = res[1]
-            
-            return (allowed_flag == 1, tokens_left)
-            
-        except Exception as e:
-            print("Redis lua script failed:", e)
-            return True, 0
+            if tokens >= cost then
+                tokens = tokens - cost
+                allowed = 1
+            else
+                local deficit = cost - tokens
+                retry_after = math.ceil(deficit / refill_per_sec)
+                if retry_after < 1 then
+                    retry_after = 1
+                end
+            end
+
+            redis.call("HSET", key, "tokens", tokens, "last_ms", last_ms)
+
+            local ttl = math.ceil(capacity / refill_per_sec)
+            if ttl < 1 then
+                ttl = 1
+            end
+            redis.call("EXPIRE", key, ttl)
+
+            local remaining = math.floor(tokens / scale)
+            if remaining < 0 then
+                remaining = 0
+            end
+
+            return {allowed, remaining, retry_after}
+            """
+        )
+
+    def allow(self, client_id: str, cost: int = 1) -> dict[str, int | bool]:
+        if cost <= 0:
+            raise ValueError("cost must be > 0")
+
+        key = f"circuit:rl:{client_id}"
+        now_ms = int(time.time() * 1000)
+        cost_scaled = cost * self._scale
+
+        allowed, remaining, retry_after = self._script(
+            keys=[key],
+            args=[
+                self._capacity_scaled,
+                self._refill_per_sec_scaled,
+                now_ms,
+                cost_scaled,
+                self._scale,
+            ],
+        )
+
+        return {
+            "allowed": bool(int(allowed)),
+            "limit": self.max_capacity,
+            "remaining": int(remaining),
+            "retry_after": int(retry_after),
+        }
+
+    def headers(self, result: dict[str, int | bool]) -> dict[str, str]:
+        headers = {
+            "X-RateLimit-Limit": str(result["limit"]),
+            "X-RateLimit-Remaining": str(result["remaining"]),
+        }
+
+        if not result["allowed"] and result["retry_after"] > 0:
+            headers["Retry-After"] = str(result["retry_after"])
+
+        return headers

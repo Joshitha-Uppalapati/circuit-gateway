@@ -13,7 +13,6 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
 
-    stream: Optional[bool] = False
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
@@ -41,17 +40,3 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
     usage: Optional[UsageInfo] = None
-
-
-class NormalizedChatResponse(BaseModel):
-    """Provider-agnostic response format."""
-
-    text: str
-    model: str
-    provider: str
-
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-
-    raw: Dict[str, Any]

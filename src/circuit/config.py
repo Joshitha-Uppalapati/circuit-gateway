@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 from typing import List
 
 
@@ -13,11 +14,24 @@ class Settings(BaseSettings):
     CIRCUIT_DAILY_USD_LIMIT: float = 10.0
     CIRCUIT_MAX_OUTPUT_TOKENS: int = 4096
 
+    OPENAI_API_KEY: str | None = None
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
+    
+    GLOBAL_REQUEST_TIMEOUT_SEC: float = 15.0
+    DATABASE_URL: str
+
+    @model_validator(mode="after")
+    def validate_provider_config(self):
+        if self.PROVIDER.upper() == "OPENAI" and not self.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY is required when PROVIDER=OPENAI")
+        return self
 
     @property
     def api_keys(self) -> List[str]:

@@ -9,7 +9,6 @@ def get_redis_client() -> redis.Redis | None:
     url = os.getenv("REDIS_URL")
 
     if not url:
-        print("redis not configured")
         return None
 
     try:
@@ -19,6 +18,5 @@ def get_redis_client() -> redis.Redis | None:
 
         return client
 
-    except redis.ConnectionError as e:
-        print("redis not reachable, falling back:", e)
+    except Exception:
         return None

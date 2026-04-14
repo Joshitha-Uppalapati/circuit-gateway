@@ -41,12 +41,8 @@ async def with_retries(
             attempt += 1
 
             if attempt > config.max_retries:
-                bound = getattr(fn, "__self__", None)
-                
-                if bound and hasattr(bound, "failures_left"):
-                    if bound.failures_left > 0:
-                        bound.failures_left -= 1
                 raise
+                
 
             delay = min(
                 config.base_delay * (2 ** (attempt - 1)),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import asyncio
+
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +11,9 @@ DB_PATH = Path("data/circuit.db")
 _conn: sqlite3.Connection | None = None
 
 
+async def record_request_bg(**kwargs):
+    await asyncio.to_thread(record_request, **kwargs)
+    
 def get_connection() -> sqlite3.Connection:
     global _conn
 
