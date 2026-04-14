@@ -1,4 +1,3 @@
-import pytest
 
 
 async def test_chat_completions_eval_header(client, monkeypatch):
