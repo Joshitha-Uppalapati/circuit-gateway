@@ -1,44 +1,39 @@
 import os
-
-from fastapi import FastAPI
-
 from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-_tracer = trace.get_tracer("circuit")
+from circuit.config import settings
 
 
-def setup_telemetry(app: FastAPI):
+def setup_telemetry(app):
+    if os.getenv("OTEL_ENABLED", "false").lower() != "true":
+        return
+
     resource = Resource.create(
         {
-            "service.name": os.getenv("OTEL_SERVICE_NAME", "circuit-gateway"),
-            "service.version": os.getenv("OTEL_SERVICE_VERSION", "0.1.0"),
-            "deployment.environment": os.getenv("APP_ENV", "dev"),
+            "service.name": settings.OTEL_SERVICE_NAME,
+            "service.version": settings.OTEL_SERVICE_VERSION,
+            "deployment.environment": settings.APP_ENV,
         }
     )
 
     provider = TracerProvider(resource=resource)
-    provider.add_span_processor(
-        BatchSpanProcessor(
-            OTLPSpanExporter(
-                endpoint=os.getenv(
-                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                    os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces"),
-                )
-            )
-        )
+    trace.set_tracer_provider(provider)
+
+    exporter = OTLPSpanExporter(
+        endpoint=settings.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        or settings.OTEL_EXPORTER_OTLP_ENDPOINT
     )
 
-    trace.set_tracer_provider(provider)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
 
     FastAPIInstrumentor.instrument_app(app)
     HTTPXClientInstrumentor().instrument()
 
 
 def get_tracer():
-    return _tracer
+    return trace.get_tracer(__name__)
