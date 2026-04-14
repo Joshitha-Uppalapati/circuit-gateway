@@ -4,6 +4,8 @@ import time
 import uuid
 import asyncio
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -21,15 +23,21 @@ from circuit.observability.request_logger import log_request
 from circuit.cost.calculator import calculate_cost
 from circuit.quota import check_daily_quota
 
+from circuit.config import settings
 
 app = FastAPI()
 app.add_middleware(AuthMiddleware)
 
-# CONFIG
+# Global request timeout for the whole pipeline
 GLOBAL_TIMEOUT_SECONDS = 3.0
 
+print("RAW ENV:", os.getenv("CIRCUIT_API_KEYS"))
+print("PARSED:", settings.api_keys)
+ 
+# Debug: check what keys are actually loaded
+print("Loaded API keys:", settings.api_keys)
 
-# REDIS SETUP
+# Redis setup
 redis_client = get_redis_client()
 
 if redis_client:
@@ -38,7 +46,7 @@ else:
     print("redis not available")
 
 
-# RATE LIMITER
+# Rate limiter per client
 rate_limiter = (
     RedisRateLimiter(redis_conn=redis_client, max_capacity=20, refill_rate=5.0)
     if redis_client
@@ -46,18 +54,10 @@ rate_limiter = (
 )
 
 
-# CIRCUIT BREAKER
-breaker = (
-    RedisCircuitBreaker("primary")
-    if redis_client
-    else None
-)
-
-
-def breaker_state_value():
+def breaker_state_value(breaker):
     """
     Safely read breaker state from Redis.
-    Redis can return bytes OR str depending on config.
+    Redis may return bytes or string depending on configuration.
     """
     if not breaker:
         return "disabled"
@@ -73,7 +73,7 @@ def breaker_state_value():
     return str(state)
 
 
-# PROVIDERS
+# Providers
 try:
     primary_provider = MockOpenAIProvider()
 except Exception as e:
@@ -83,20 +83,25 @@ except Exception as e:
 fallback_provider = OllamaProvider()
 
 
-# HEALTH
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# CORE REQUEST HANDLER
 async def _handle_chat(request: Request):
     start = time.time()
     request_id = str(uuid.uuid4())
 
     client_key_hash = request.state.client_key_hash
 
-    # PARSE REQUEST
+    # Create a per-client circuit breaker
+    breaker = (
+        RedisCircuitBreaker(f"primary:{client_key_hash}")
+        if redis_client
+        else None
+    )
+
+    # Parse request body
     try:
         payload = await request.json()
     except Exception:
@@ -110,7 +115,7 @@ async def _handle_chat(request: Request):
             },
         )
 
-    # DEFAULTS
+    # Defaults
     result = None
     failure_reason = None
     provider_used = "primary"
@@ -119,20 +124,25 @@ async def _handle_chat(request: Request):
     prompt_tokens = 0
     completion_tokens = 0
 
-    # RATE LIMIT
+    # Track total requests for rate based breaker logic
+    if breaker:
+        breaker.redis.incr(f"{breaker.name}:total")
+        breaker.redis.expire(f"{breaker.name}:total", 10)
+
+    # Rate limiting
     if rate_limiter:
         allowed, tokens_left = rate_limiter.allow(client_key_hash)
-        
+
         if not allowed:
             failure_reason = "rate_limited"
-            
+
             try:
                 log_request({
                     "request_id": request_id,
                     "client": client_key_hash,
                     "provider": "none",
                     "latency_ms": (time.time() - start) * 1000,
-                    "breaker_state": breaker_state_value(),
+                    "breaker_state": breaker_state_value(breaker),
                     "tokens_in": 0,
                     "tokens_out": 0,
                     "failure_reason": failure_reason,
@@ -141,7 +151,7 @@ async def _handle_chat(request: Request):
                 })
             except Exception:
                 pass
-            
+
             return JSONResponse(
                 status_code=429,
                 content={
@@ -152,19 +162,19 @@ async def _handle_chat(request: Request):
                 },
             )
 
-    # QUOTA
+    # Quota check
     ok, _, limit = check_daily_quota(client_key_hash, 0.0)
 
     if not ok:
         failure_reason = "quota_exceeded"
-        
+
         try:
             log_request({
                 "request_id": request_id,
                 "client": client_key_hash,
                 "provider": "none",
                 "latency_ms": (time.time() - start) * 1000,
-                "breaker_state": breaker_state_value(),
+                "breaker_state": breaker_state_value(breaker),
                 "tokens_in": 0,
                 "tokens_out": 0,
                 "failure_reason": failure_reason,
@@ -173,7 +183,7 @@ async def _handle_chat(request: Request):
             })
         except Exception:
             pass
-        
+
         return JSONResponse(
             status_code=429,
             content={
@@ -184,7 +194,7 @@ async def _handle_chat(request: Request):
             },
         )
 
-    # PRIMARY CALL
+    # Primary provider attempt
     if primary_provider:
         try_primary = True
 
@@ -218,7 +228,7 @@ async def _handle_chat(request: Request):
 
                 result = None
 
-    # FALLBACK
+    # Fallback provider
     if result is None:
         provider_used = "fallback"
 
@@ -228,10 +238,12 @@ async def _handle_chat(request: Request):
                 timeout=2.5,
             )
 
-            # fallback worked → system recovered
+            # If fallback succeeds and no failure reason was set,
+            # it means primary was skipped or unavailable
             if failure_reason is None:
                 failure_reason = "primary_unavailable"
-            
+
+            # If breaker blocked primary, reflect that explicitly
             elif failure_reason == "provider_error" and breaker and not breaker.allow_request():
                 failure_reason = "breaker_open"
 
@@ -277,13 +289,14 @@ async def _handle_chat(request: Request):
                 "usage": {},
             }
 
-    # METRICS + ENRICHMENT
+    # Extract usage
     usage = result.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
 
     latency_ms = (time.time() - start) * 1000
-    
+
+    # Cost calculation
     if provider_used == "fallback":
         cost = 0.0
     else:
@@ -299,7 +312,7 @@ async def _handle_chat(request: Request):
         "request_id": request_id,
         "client_key_hash": client_key_hash,
         "cost_usd": cost,
-        "breaker_state": breaker_state_value(),
+        "breaker_state": breaker_state_value(breaker),
         "provider": provider_used,
         "tokens_left": tokens_left,
     }
@@ -307,17 +320,17 @@ async def _handle_chat(request: Request):
     result["meta"] = {
         "failure_reason": failure_reason,
         "used_fallback": provider_used == "fallback",
-        "is_degraded": failure_reason is not None
+        "is_degraded": failure_reason is not None,
     }
 
-    # LOGGING (never block response)
+    # Logging should never break the request
     try:
         log_request({
             "request_id": request_id,
             "client": client_key_hash,
             "provider": provider_used,
             "latency_ms": latency_ms,
-            "breaker_state": breaker_state_value(),
+            "breaker_state": breaker_state_value(breaker),
             "tokens_in": prompt_tokens,
             "tokens_out": completion_tokens,
             "failure_reason": failure_reason,
@@ -330,7 +343,6 @@ async def _handle_chat(request: Request):
     return result
 
 
-# PUBLIC ENDPOINT
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:

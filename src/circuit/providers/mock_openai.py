@@ -1,19 +1,25 @@
-from __future__ import annotations
+import asyncio
 import time
+
 
 class MockOpenAIProvider:
     async def chat_completions(self, payload: dict):
-        content = payload["messages"][-1]["content"]
+        content = payload["messages"][0]["content"]
 
-        # simulate failure trigger
-        if "fail" in content or "force failure" in content:
-            raise Exception("forced failure")
+        # simulate latency spike
+        if "slow" in content:
+            await asyncio.sleep(2)  # triggers timeout
 
+        # simulate failure
+        if "fail" in content:
+            raise Exception("simulated provider failure")
+
+        # normal case
         return {
             "id": f"mock-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "gpt-4o",  
+            "model": "gpt-4o",
             "choices": [
                 {
                     "index": 0,

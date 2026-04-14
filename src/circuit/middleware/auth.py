@@ -18,6 +18,7 @@ PUBLIC_PATHS = {
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # Allow public endpoints without auth
         if request.url.path in PUBLIC_PATHS:
             return await call_next(request)
 
@@ -35,16 +36,19 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        if token not in settings.api_keys:
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "error": {
-                        "code": "authentication_error",
-                        "message": "Invalid API key",
-                    }
-                },
-            )
+        # DEV MODE
+        if settings.api_keys:
+            if token not in settings.api_keys:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "code": "authentication_error",
+                            "message": "Invalid API key",
+                        }
+                    },
+                )
 
         request.state.client_key_hash = hashlib.sha256(token.encode()).hexdigest()[:12]
+
         return await call_next(request)
