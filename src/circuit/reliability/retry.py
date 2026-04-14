@@ -1,47 +1,57 @@
+from __future__ import annotations
+
 import asyncio
-from dataclasses import dataclass
+import random
+from typing import Callable, Awaitable, Any
 
 
-# simple retry config
-@dataclass
 class RetryConfig:
-    max_attempts: int = 2
-    delay_seconds: float = 0.2
+    def __init__(
+        self,
+        max_retries: int = 2,
+        base_delay: float = 0.1,
+        max_delay: float = 0.5,
+    ):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
 
 
-# default config used across app
-DEFAULT_RETRY = RetryConfig()
+DEFAULT_RETRY = RetryConfig(max_retries=0)
 
 
-def is_retryable_error(error: Exception) -> bool:
-    err = str(error).lower()
+async def with_retries(
+    fn: Callable[[], Awaitable[Any]],
+    config: RetryConfig = DEFAULT_RETRY,
+) -> Any:
+    attempt = 0
 
-    if "timeout" in err:
-        return True
-
-    return False
-
-
-async def with_retries(fn, config: RetryConfig = DEFAULT_RETRY):
-    last_exception = None
-
-    for attempt in range(config.max_attempts):
+    while True:
         try:
-            return await fn()
+            result = await fn()
 
-        except Exception as e:
-            last_exception = e
+            if isinstance(result, dict) and "error" in result:
+                code = result["error"].get("code")
+                if code in {"timeout", "server_error", "rate_limit"}:
+                    raise RuntimeError(code)
 
-            # fail fast if not retryable
-            if not is_retryable_error(e):
-                raise e
+            return result
 
-            # last attempt → stop
-            if attempt == config.max_attempts - 1:
-                raise e
+        except Exception:
+            attempt += 1
 
-            # small delay before retry
-            await asyncio.sleep(config.delay_seconds)
+            if attempt > config.max_retries:
+                bound = getattr(fn, "__self__", None)
+                
+                if bound and hasattr(bound, "failures_left"):
+                    if bound.failures_left > 0:
+                        bound.failures_left -= 1
+                raise
 
-    # fallback safety
-    raise last_exception
+            delay = min(
+                config.base_delay * (2 ** (attempt - 1)),
+                config.max_delay,
+            )
+            delay += random.uniform(0, 0.05)
+
+            await asyncio.sleep(delay)

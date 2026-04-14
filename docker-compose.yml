@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    container_name: circuit-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONPATH=/app/src
+      - CIRCUIT_API_KEYS=test-key
+      - PROVIDER=MOCK
+      - FAIL_FIRST_N=5

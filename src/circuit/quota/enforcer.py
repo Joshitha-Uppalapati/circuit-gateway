@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 from datetime import datetime, timezone
 
@@ -8,7 +10,7 @@ from circuit.storage.sqlite import get_daily_spend
 
 
 def hash_key(raw_key: str) -> str:
-    return hashlib.sha256(raw_key.encode()).hexdigest()[:8]
+    return hashlib.sha256(raw_key.encode()).hexdigest()[:12]
 
 
 def enforce_quota(request: Request, estimated_cost: float = 0.0) -> str:
@@ -16,16 +18,13 @@ def enforce_quota(request: Request, estimated_cost: float = 0.0) -> str:
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key")
 
-    raw_key = auth.replace("Bearer ", "")
+    raw_key = auth.removeprefix("Bearer ").strip()
     key_hash = hash_key(raw_key)
 
     today = datetime.now(timezone.utc).date().isoformat()
     spent = get_daily_spend(key_hash, today)
 
     if spent + estimated_cost > DEFAULT_DAILY_USD_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Daily quota exceeded",
-        )
+        raise HTTPException(status_code=429, detail="Daily quota exceeded")
 
     return key_hash

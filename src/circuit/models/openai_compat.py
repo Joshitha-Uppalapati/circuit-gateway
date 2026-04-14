@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
-# Request models
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -12,16 +13,15 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
 
+    stream: Optional[bool] = False
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
-    stream: Optional[bool] = False
     max_tokens: Optional[int] = None
     stop: Optional[List[str]] = None
-
     user: Optional[str] = None
 
-# Response models
+
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatMessage
@@ -39,16 +39,12 @@ class ChatCompletionResponse(BaseModel):
     object: Literal["chat.completion"]
     created: int
     model: str
-
     choices: List[ChatCompletionChoice]
     usage: Optional[UsageInfo] = None
 
 
-# Internal normalized model
 class NormalizedChatResponse(BaseModel):
-    """
-    Provider-agnostic response format used internally.
-    """
+    """Provider-agnostic response format."""
 
     text: str
     model: str

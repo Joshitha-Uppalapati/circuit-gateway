@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from enum import Enum
 
@@ -15,35 +17,38 @@ class CircuitBreaker:
 
         self.state = BreakerState.CLOSED
         self.fail_count = 0
-        self.opened_at = None
+        self.opened_at: float | None = None
         self.half_open_in_flight = False
 
     def allow_request(self) -> bool:
+        now = time.time()
+
         if self.state == BreakerState.CLOSED:
             return True
 
         if self.state == BreakerState.OPEN:
-            if time.time() - self.opened_at >= self.cooldown_seconds:
+            if self.opened_at is not None and now - self.opened_at >= self.cooldown_seconds:
                 self.state = BreakerState.HALF_OPEN
                 self.half_open_in_flight = False
-                return True
-            return False
+            else:
+                return False
 
         if self.state == BreakerState.HALF_OPEN:
-            if not self.half_open_in_flight:
-                self.half_open_in_flight = True
-                return True
-            return False
+            if self.half_open_in_flight:
+                return False
+
+            self.half_open_in_flight = True
+            return True
 
         return False
 
-    def record_success(self):
+    def record_success(self) -> None:
         self.fail_count = 0
         self.state = BreakerState.CLOSED
         self.half_open_in_flight = False
         self.opened_at = None
 
-    def record_failure(self):
+    def record_failure(self) -> None:
         self.fail_count += 1
 
         if self.state == BreakerState.HALF_OPEN:
@@ -53,7 +58,7 @@ class CircuitBreaker:
         if self.fail_count >= self.failure_threshold:
             self._trip()
 
-    def _trip(self):
+    def _trip(self) -> None:
         self.state = BreakerState.OPEN
         self.opened_at = time.time()
         self.half_open_in_flight = False

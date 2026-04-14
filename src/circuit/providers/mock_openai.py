@@ -1,38 +1,54 @@
+from __future__ import annotations
+
 import asyncio
 import time
+import uuid
+from typing import Dict, Any
 
 
 class MockOpenAIProvider:
-    async def chat_completions(self, payload: dict):
-        content = payload["messages"][0]["content"]
+    def __init__(self) -> None:
+        self.failures_left = 5
 
-        # simulate latency spike
-        if "slow" in content:
-            await asyncio.sleep(2)  # triggers timeout
+    async def chat_completions(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        start = time.perf_counter()
 
-        # simulate failure
-        if "fail" in content:
-            raise Exception("simulated provider failure")
+        if self.failures_left > 0:
+            self.failures_left -= 1
+            await asyncio.sleep(0.05)
+            return {
+                "error": {
+                    "code": "server_error",
+                    "message": "forced failure",
+                }
+            }
 
-        # normal case
-        return {
-            "id": f"mock-{int(time.time())}",
+        await asyncio.sleep(0.01)
+
+        messages = payload.get("messages", [])
+        user_content = ""
+
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_content = m.get("content", "")
+                break
+
+        result = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "gpt-4o",
+            "model": payload.get("model", "gpt-4o"),
             "choices": [
                 {
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": "Mock response",
+                        "content": f"Mock response to: {user_content}",
                     },
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": 1,
-                "completion_tokens": 1,
-                "total_tokens": 2,
-            },
         }
+
+        result["latency_ms"] = (time.perf_counter() - start) * 1000
+        return result

@@ -1,15 +1,23 @@
+from __future__ import annotations
+
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path("data/circuit.db")
 
+_conn: sqlite3.Connection | None = None
+
 
 def get_connection() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    global _conn
+
+    if _conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+
+    return _conn
 
 
 def init_db() -> None:
@@ -44,7 +52,6 @@ def init_db() -> None:
     )
 
     conn.commit()
-    conn.close()
 
 
 def record_request(
@@ -91,7 +98,6 @@ def record_request(
     )
 
     conn.commit()
-    conn.close()
 
 
 def get_daily_spend(client_key_hash: str, date: str) -> float:
@@ -107,8 +113,6 @@ def get_daily_spend(client_key_hash: str, date: str) -> float:
     )
 
     row = cursor.fetchone()
-    conn.close()
-
     return row["usd_spent"] if row else 0.0
 
 
@@ -127,4 +131,3 @@ def add_spend(client_key_hash: str, date: str, amount: float) -> None:
     )
 
     conn.commit()
-    conn.close()
