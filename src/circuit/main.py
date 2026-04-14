@@ -17,6 +17,7 @@ from circuit.middleware.timeout import TimeoutMiddleware
 from circuit.models.openai_compat import ChatCompletionRequest
 from circuit.observability.metrics import metrics
 from circuit.observability.request_logger import log_request
+from circuit.observability.telemetry import get_tracer, setup_telemetry
 from circuit.providers.factory import get_active_providers, get_chat_provider
 from circuit.providers.ollama_provider import OllamaProvider
 from circuit.quota.enforcer import enforce_quota
@@ -34,6 +35,7 @@ from circuit.storage.redis_client import get_redis_client
 from circuit.storage.task_tracker import drain, spawn
 from circuit.tokenizer import count_tokens_from_messages, count_tokens_from_text
 
+from circuit.evals.response_eval import evaluate_response
 
 setup_logging()
 
@@ -54,18 +56,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+setup_telemetry(app)
+
 app.add_middleware(TimeoutMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(AuthMiddleware)
 app.add_middleware(LatencyMiddleware)
 
+tracer = get_tracer()
+
 provider = get_chat_provider()
 fallback_provider = OllamaProvider(base_url=settings.OLLAMA_BASE_URL)
 
 redis_conn = get_redis_client()
 breaker = RedisCircuitBreaker("primary")
-rate_limiter = RedisRateLimiter(redis_conn, max_capacity=20, refill_rate=5.0)
+rate_limiter = (
+    RedisRateLimiter(redis_conn, max_capacity=20, refill_rate=5.0)
+    if redis_conn
+    else None
+)
 
 
 @app.get("/health")
@@ -76,7 +86,7 @@ async def health():
     try:
         redis = get_redis_client()
         if redis is None:
-            raise RuntimeError("redis unavailable")
+            raise RuntimeError()
         pong = redis.ping()
         if asyncio.iscoroutine(pong):
             await pong
@@ -140,7 +150,11 @@ async def chat_completions(
     request_id = getattr(request.state, "request_id", "unknown")
     client_key_hash = enforce_quota(request, estimated_cost=0.0)
 
-    rate_limit = rate_limiter.allow(client_key_hash)
+    if rate_limiter:
+        rate_limit = rate_limiter.allow(client_key_hash)
+    else:
+        rate_limit = {"allowed": True, "limit": 0, "remaining": 0, "retry_after": 0}
+
     if not rate_limit["allowed"]:
         metrics.inc("total_429", client=client_key_hash)
         metrics.inc("rate_limit_hits", client=client_key_hash)
@@ -152,7 +166,7 @@ async def chat_completions(
                     "message": "Too many requests. Slow down.",
                 }
             },
-            headers=rate_limiter.headers(rate_limit),
+            headers=rate_limiter.headers(rate_limit) if rate_limiter else {},
         )
 
     if not breaker.allow_request():
@@ -182,9 +196,15 @@ async def chat_completions(
         if isinstance(result, dict) and "error" in result:
             raise RuntimeError(result["error"].get("message"))
 
-    except Exception:
+    except Exception as primary_exc:
         try:
-            result = await fallback_provider.chat_completions(payload_dict)
+            with tracer.start_as_current_span("provider.fallback") as span:
+                span.set_attribute("fallback.from_provider", type(provider).__name__)
+                span.set_attribute("fallback.to_provider", type(fallback_provider).__name__)
+                span.set_attribute("fallback.model", model)
+                span.set_attribute("fallback.reason", type(primary_exc).__name__)
+
+                result = await fallback_provider.chat_completions(payload_dict)
 
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(result["error"].get("message"))
@@ -231,10 +251,19 @@ async def chat_completions(
         .get("message", {})
         .get("content", "")
     )
+    
+    eval_result = evaluate_response(
+        payload = payload_dict,
+        model = model,
+        output_text = assistant_content,
+    )
 
-    completion_tokens = count_tokens_from_text(model, assistant_content)
+    result["choices"][0]["message"]["content"] = eval_result.output_text
+
+    prompt_tokens = count_tokens_from_messages(model, messages)
+    completion_tokens = eval_result.token_count
     cost_usd = estimate_cost_usd(model, prompt_tokens, completion_tokens)
-
+    
     metrics.inc("total_success", client=client_key_hash)
     metrics.inc("total_tokens_input", prompt_tokens, client=client_key_hash)
     metrics.inc("total_tokens_output", completion_tokens, client=client_key_hash)
@@ -268,6 +297,7 @@ async def chat_completions(
         "failure_reason": None,
         "input_size": len(messages),
         "used_fallback": provider_used != type(provider).__name__,
+        "eval_result": eval_result.status,
     }
     spawn(log_request(log_data))
 
@@ -277,5 +307,6 @@ async def chat_completions(
         "cost_usd": cost_usd,
     }
 
-    headers = rate_limiter.headers(rate_limit)
+    headers = rate_limiter.headers(rate_limit) if rate_limiter else {}
+    headers["X-Circuit-Eval-Result"] = eval_result.status
     return JSONResponse(content=result, headers=headers)

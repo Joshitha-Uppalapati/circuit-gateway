@@ -8,7 +8,6 @@ class Settings(BaseSettings):
     CIRCUIT_API_KEYS: str
 
     CIRCUIT_LOG_PAYLOADS: bool = False
-    CIRCUIT_DB_PATH: str = "./circuit.db"
 
     CIRCUIT_REQUESTS_PER_MIN: int = 60
     CIRCUIT_DAILY_USD_LIMIT: float = 10.0
@@ -18,14 +17,20 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
 
+    OTEL_SERVICE_NAME: str = "circuit-gateway"
+    OTEL_SERVICE_VERSION: str = "0.1.0"
+    APP_ENV: str = "dev"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4318"
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: str | None = None
+
+    GLOBAL_REQUEST_TIMEOUT_SEC: float = 15.0
+    DATABASE_URL: str
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
-    
-    GLOBAL_REQUEST_TIMEOUT_SEC: float = 15.0
-    DATABASE_URL: str
 
     @model_validator(mode="after")
     def validate_provider_config(self):
