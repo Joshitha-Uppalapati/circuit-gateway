@@ -1,5 +1,5 @@
 import pytest
-
+import pytest_asyncio
 from httpx import AsyncClient
 
 from circuit.main import app
@@ -54,16 +54,13 @@ def fake_postgres(monkeypatch):
         async def __aexit__(self, *args):
             pass
 
-    async def fake_get_pool():
-        return FakePool()
-
     monkeypatch.setattr(
         "circuit.storage.postgres_client.get_pool",
         lambda: FakePool(),
     )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client():
     async with AsyncClient(app=app, base_url="http://test") as ac:
         yield ac

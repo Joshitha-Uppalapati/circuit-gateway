@@ -1,7 +1,6 @@
 import pytest
 
 
-@pytest.mark.asyncio
 async def test_chat_completions_eval_header(client, monkeypatch):
     async def fake_chat(payload):
         return {
