@@ -1,6 +1,6 @@
 import pytest
 import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
+from httpx import AsyncClient
 
 from circuit.main import app
 
@@ -34,9 +34,23 @@ class FakeRedis:
         pass
 
     def register_script(self, script):
+        store = self.store
+
         def run(keys=None, args=None):
-            capacity = int(args[0]) if args else 0
-            return [1, capacity, 0]  # allow request
+            key = keys[0]
+            capacity = int(args[0])
+            cost = int(args[3])
+
+            bucket = store.get(key, {"tokens": capacity})
+            tokens = int(bucket.get("tokens", capacity))
+
+            if tokens >= cost:
+                tokens -= cost
+                store[key] = {"tokens": tokens}
+                return [1, tokens, 0]
+            else:
+                return [0, 0, 1]
+
         return run
 
 
@@ -76,7 +90,5 @@ def fake_postgres(monkeypatch):
 
 @pytest_asyncio.fixture
 async def client():
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
+    async with AsyncClient(app=app, base_url="http://test") as ac:
         yield ac

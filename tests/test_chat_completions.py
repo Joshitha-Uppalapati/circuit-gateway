@@ -1,5 +1,3 @@
-
-
 async def test_chat_completions_eval_header(client, monkeypatch):
     async def fake_chat(payload):
         return {
@@ -20,6 +18,7 @@ async def test_chat_completions_eval_header(client, monkeypatch):
 
     response = await client.post(
         "/v1/chat/completions",
+        headers={"Authorization": "Bearer test"},
         json={
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hi"}],
