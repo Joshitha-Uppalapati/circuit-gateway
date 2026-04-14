@@ -1,8 +1,8 @@
 import os
+
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
@@ -13,13 +13,14 @@ def setup_telemetry(app):
     if os.getenv("OTEL_ENABLED", "false").lower() != "true":
         return
 
-    resource = Resource.create(
-        {
-            "service.name": settings.OTEL_SERVICE_NAME,
-            "service.version": settings.OTEL_SERVICE_VERSION,
-            "deployment.environment": settings.APP_ENV,
-        }
-    )
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    resource = Resource.create({
+        "service.name": settings.OTEL_SERVICE_NAME,
+        "service.version": settings.OTEL_SERVICE_VERSION,
+        "deployment.environment": settings.APP_ENV,
+    })
 
     provider = TracerProvider(resource=resource)
     trace.set_tracer_provider(provider)
