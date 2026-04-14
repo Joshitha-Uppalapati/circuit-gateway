@@ -3,8 +3,8 @@ MODEL_PRICING_USD_PER_1K = {
         "prompt": 0.005,
         "completion": 0.015,
     },
-    "gpt-4o-mini": {
-        "prompt": 0.00015,
-        "completion": 0.0006,
+    "llama3.2:1b": {  
+        "prompt": 0.0005,
+        "completion": 0.0005,
     },
 }

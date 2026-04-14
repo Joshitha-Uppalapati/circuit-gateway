@@ -34,8 +34,12 @@ async def with_retries(
                 if code == "timeout":
                     raise RuntimeError("timeout")
 
-                if code in {"server_error", "rate_limit"}:
-                    raise RuntimeError(code)
+                if code == "server_error":
+                    raise RuntimeError("server_error")
+
+                if code == "rate_limit":
+                    await asyncio.sleep(0.5)
+                    raise RuntimeError("rate_limit")
 
             return result
 
