@@ -13,7 +13,7 @@ from circuit.middleware.auth import AuthMiddleware
 from circuit.middleware.latency import LatencyMiddleware
 from circuit.middleware.logging import LoggingMiddleware, setup_logging
 from circuit.middleware.request_id import RequestIDMiddleware
-from circuit.middleware.timeout import TimeoutMiddleware
+from circuit.reliability.timeout import TimeoutMiddleware
 from circuit.models.openai_compat import ChatCompletionRequest
 from circuit.observability.metrics import metrics
 from circuit.observability.request_logger import log_request
