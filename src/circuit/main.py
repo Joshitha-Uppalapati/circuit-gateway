@@ -33,7 +33,7 @@ from circuit.storage.postgres_client import (
 )
 from circuit.storage.redis_client import get_redis_client
 from circuit.storage.task_tracker import drain, spawn
-from circuit.tokenizer import count_tokens_from_messages, count_tokens_from_text
+from circuit.tokenizer import count_tokens_from_messages
 
 from circuit.evals.response_eval import evaluate_response
 

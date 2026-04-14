@@ -1,8 +1,6 @@
 import pytest
-import asyncio
 
 from httpx import AsyncClient
-from fastapi import FastAPI
 
 from circuit.main import app
 
