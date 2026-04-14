@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: str | None = None
 
     GLOBAL_REQUEST_TIMEOUT_SEC: float = 15.0
-    DATABASE_URL: str
+    DATABASE_URL: str = "postgresql://localhost:5432/circuit"
 
     model_config = SettingsConfigDict(
         env_file=".env",

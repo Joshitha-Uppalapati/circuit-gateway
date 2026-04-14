@@ -5,7 +5,7 @@ from circuit.reliability.redis_rate_limiter import RedisRateLimiter
 
 @pytest.mark.asyncio
 async def test_rate_limiter_blocks_after_capacity(fake_redis):
-    limiter = RedisRateLimiter(fake_redis, max_capacity=2, refill_rate=0)
+    limiter = RedisRateLimiter(fake_redis, max_capacity=2, refill_rate=0.001)
 
     result1 = limiter.allow("client1")
     result2 = limiter.allow("client1")

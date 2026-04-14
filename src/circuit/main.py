@@ -13,7 +13,7 @@ from circuit.middleware.auth import AuthMiddleware
 from circuit.middleware.latency import LatencyMiddleware
 from circuit.middleware.logging import LoggingMiddleware, setup_logging
 from circuit.middleware.request_id import RequestIDMiddleware
-from circuit.middleware.timeout import TimeoutMiddleware
+from circuit.reliability.timeout import TimeoutMiddleware
 from circuit.models.openai_compat import ChatCompletionRequest
 from circuit.observability.metrics import metrics
 from circuit.observability.request_logger import log_request
@@ -33,7 +33,7 @@ from circuit.storage.postgres_client import (
 )
 from circuit.storage.redis_client import get_redis_client
 from circuit.storage.task_tracker import drain, spawn
-from circuit.tokenizer import count_tokens_from_messages, count_tokens_from_text
+from circuit.tokenizer import count_tokens_from_messages
 
 from circuit.evals.response_eval import evaluate_response
 
