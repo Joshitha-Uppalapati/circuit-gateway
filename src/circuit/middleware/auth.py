@@ -11,7 +11,7 @@ from circuit.config import settings
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         raw = request.headers.get("authorization") or ""
-        token = raw.replace("Bearer", "").strip()
+        token = raw.removeprefix("Bearer ").strip()
 
         if not token:
             return JSONResponse(

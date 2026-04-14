@@ -32,3 +32,19 @@ def count_tokens_from_text(model: str, text: str) -> int:
     encoding = _get_encoding(model)
     return len(encoding.encode(text))
 
+def truncate_text_to_max_tokens(model: str, text: str, max_tokens: int) -> str:
+    try:
+        import tiktoken
+
+        encoding = tiktoken.encoding_for_model(model)
+    except Exception:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    token_ids = encoding.encode(text)
+    if len(token_ids) <= max_tokens:
+        return text
+
+    return encoding.decode(token_ids[:max_tokens])
+

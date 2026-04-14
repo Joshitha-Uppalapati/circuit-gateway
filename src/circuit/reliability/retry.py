@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import random
 from typing import Callable, Awaitable, Any
@@ -15,13 +17,13 @@ class RetryConfig:
         self.max_delay = max_delay
 
 
-DEFAULT_RETRY = RetryConfig()
+DEFAULT_RETRY = RetryConfig(max_retries=0)
 
 
 async def with_retries(
     fn: Callable[[], Awaitable[Any]],
     config: RetryConfig = DEFAULT_RETRY,
-):
+) -> Any:
     attempt = 0
 
     while True:
@@ -30,16 +32,8 @@ async def with_retries(
 
             if isinstance(result, dict) and "error" in result:
                 code = result["error"].get("code")
-
-                if code == "timeout":
-                    raise RuntimeError("timeout")
-
-                if code == "server_error":
-                    raise RuntimeError("server_error")
-
-                if code == "rate_limit":
-                    await asyncio.sleep(0.5)
-                    raise RuntimeError("rate_limit")
+                if code in {"timeout", "server_error", "rate_limit"}:
+                    raise RuntimeError(code)
 
             return result
 
@@ -48,12 +42,12 @@ async def with_retries(
 
             if attempt > config.max_retries:
                 raise
+                
 
             delay = min(
                 config.base_delay * (2 ** (attempt - 1)),
                 config.max_delay,
             )
-
             delay += random.uniform(0, 0.05)
 
             await asyncio.sleep(delay)

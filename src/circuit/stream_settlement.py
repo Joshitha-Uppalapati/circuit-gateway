@@ -45,7 +45,6 @@ class StreamSession:
 
         full_output = "".join(self.output_chunks)
 
-        # REAL TOKEN COUNTING (no more char hacks)
         prompt_tokens = count_tokens_from_messages(self.model, self.messages)
         completion_tokens = count_tokens_from_text(self.model, full_output)
 
@@ -55,8 +54,7 @@ class StreamSession:
             completion_tokens,
         )
 
-        # Final quota check
-        ok, spent, limit = check_daily_quota(
+        ok, _, _ = check_daily_quota(
             self.client_key_hash,
             cost_usd,
         )

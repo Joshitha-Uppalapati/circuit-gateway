@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import time
-from typing import Dict
+from collections import OrderedDict
 
 
 class TokenBucket:
@@ -13,7 +15,6 @@ class TokenBucket:
         now = time.time()
         elapsed = now - self.last_refill
 
-        # Refill tokens based on elapsed time
         refill_amount = elapsed * self.refill_rate
         if refill_amount > 0:
             self.tokens = min(self.capacity, self.tokens + refill_amount)
@@ -27,19 +28,27 @@ class TokenBucket:
 
 
 class RateLimiter:
-    def __init__(self, capacity: int = 20, refill_rate_per_sec: float = 5):
-        """
-        capacity: max burst size
-        refill_rate_per_sec: tokens added per second
-        """
+    def __init__(
+        self,
+        capacity: int = 20,
+        refill_rate_per_sec: float = 5,
+        max_buckets: int = 1000,
+    ):
         self.capacity = capacity
         self.refill_rate = refill_rate_per_sec
-        self.buckets: Dict[str, TokenBucket] = {}
+        self.max_buckets = max_buckets
+        self.buckets: OrderedDict[str, TokenBucket] = OrderedDict()
 
     def allow(self, client_key: str) -> bool:
-        if client_key not in self.buckets:
-            self.buckets[client_key] = TokenBucket(
-                self.capacity, self.refill_rate
-            )
+        bucket = self.buckets.get(client_key)
 
-        return self.buckets[client_key].allow()
+        if bucket is None:
+            if len(self.buckets) >= self.max_buckets:
+                self.buckets.popitem(last=False)
+
+            bucket = TokenBucket(self.capacity, self.refill_rate)
+            self.buckets[client_key] = bucket
+        else:
+            self.buckets.move_to_end(client_key)
+
+        return bucket.allow()
