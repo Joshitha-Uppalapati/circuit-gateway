@@ -1,4 +1,8 @@
+import logging
+
 from circuit.storage.postgres_client import get_pool
+
+logger = logging.getLogger(__name__)
 
 
 async def log_request(data: dict) -> None:
