@@ -22,8 +22,22 @@ class FakeRedis:
         self.store[key] = int(self.store.get(key, 0)) + 1
         return self.store[key]
 
+    def hset(self, key, mapping=None, **kwargs):
+        if mapping:
+            self.store.setdefault(key, {}).update(mapping)
+
+    def hmget(self, key, *fields):
+        bucket = self.store.get(key, {})
+        return [bucket.get(f) for f in fields]
+
     def expire(self, key, ttl):
         pass
+
+    def register_script(self, script):
+        def run(keys=None, args=None):
+            capacity = int(args[0]) if args else 0
+            return [1, capacity, 0]  # allow request
+        return run
 
 
 @pytest.fixture

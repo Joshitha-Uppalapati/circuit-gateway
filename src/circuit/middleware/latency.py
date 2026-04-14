@@ -15,6 +15,6 @@ class LatencyMiddleware(BaseHTTPMiddleware):
 
         client = getattr(request.state, "client_key_hash", None)
 
-        metrics.observe_latency(duration_ms, client=client)
+        metrics.inc("latency_ms", duration_ms, client=client)
 
         return response
